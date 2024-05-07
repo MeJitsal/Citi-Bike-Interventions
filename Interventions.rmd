@@ -1,0 +1,302 @@
+---
+title: 'Cumulative Trends '
+author:
+  - name: 'Thida Chong'
+date: '`r Sys.Date()`'
+output: distill::distill_article
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  eval = TRUE,
+	echo = TRUE,
+	message = FALSE,
+	error = FALSE,
+	warning = FALSE
+)
+```
+
+Load libraries 
+```{r}
+library(tidyverse) 
+library(sf)        # for map data
+library(patchwork) # for organizing multiple graphs
+library(ggthemes)  # collection of graph themes
+theme_set(theme_tufte(base_family = 'sans'))
+```
+
+load  data and rename variables 
+
+```{r}
+data<-read_csv('data/201909-citibike-tripdata.csv')
+rider_trips <- data
+rider_trips <- 
+  rider_trips %>% 
+  rename_all(function(x) gsub(' ', '_', x)) %>%
+  rename(start_time = starttime,
+         end_time = stoptime) %>%
+  mutate(tripduration = as.difftime(tripduration / 3600, units = 'hours') )
+
+
+```
+
+
+Previously, we considered that, in general, Citi Bike's available data include measures of several attributes for each bike ride. When a bikeshare customer begins their ride, Citi Bike measures these attributes, 
+
+```
+bikeid
+start_station_id
+start_station_name
+start_station_longitude
+start_station_latitude
+start_time
+```
+
+
+any given ride begins at the same station that the previous ride ended is a most likely a normal use case
+
+$$
+\textrm{end_station_name}_{b, n} = \textrm{start_station_name}_{b, n+1}  \mid \textrm{normal usage}
+$$
+
+When the end station and the start station are NOT the same, we will assume it is an intervention by CitiBike. 
+
+$$
+\textrm{end_station_name}_{b, n} \ne \textrm{start_station_name}_{b, n+1}  \mid \textrm{intervention}
+$$
+
+Create a new dataframe as the object `interventions`.
+
+
+```{r}
+interventions <- rider_trips %>%
+  select( -birth_year, -gender ) %>%
+  arrange(
+    bikeid, start_time
+  ) %>%
+  group_by(
+    bikeid
+  ) %>%
+  mutate(
+    across(
+      .cols = matches('end_'),
+      .fns = lag
+    )
+  ) %>%
+  rename_with(
+    .cols = contains('time') | contains('_station_'),
+    ~ if_else(
+        str_detect(., 'start'),
+        str_replace(., 'start', 'end'),
+        str_replace(., 'end', 'start')
+      )
+) %>%
+    filter(end_station_name != start_station_name) %>%  
+  filter(!is.na(end_station_name)) %>%         
+  mutate(
+    usertype = "Citi Bike",                          
+    tripduration = difftime(end_time,start_time, units = 'hours'))
+  
+  
+```
+
+Find how many bikes did Citi Bike remove due to interventions at station #379 near Madison Square Garden
+```{r}
+total_stations <- n_distinct(rider_trips$start_station_id)
+# Count interventions for bikes removed from 379
+removed_bikes <- interventions %>%
+  filter(start_station_id == 379) %>%
+  distinct(bikeid) %>%
+  nrow()
+
+# Count # of interventions for bikes removed
+station_intervention_counts <- interventions %>%
+  group_by(start_station_id) %>%
+  summarize(total_interventions = n_distinct(bikeid))
+
+# Calculate % of stations with more bikes removed
+stations_with_more_bikes_removed <- station_intervention_counts %>%
+  filter(total_interventions > removed_bikes) %>%
+  nrow()
+
+total_stations <- nrow(station_intervention_counts)
+```
+
+Create a histogram showing the distribution of the number of interventions removing bikes across stations with a bin width of 100. 
+
+```{r}
+intervent_removed_bikes <- interventions %>%
+  group_by(start_station_id) %>%
+  summarise(num_interventions_removed_bikes = n())
+
+ggplot(intervent_removed_bikes, aes(x = num_interventions_removed_bikes)) +
+  geom_histogram(binwidth = 100, fill = "skyblue", alpha = 0.7) +
+  labs(
+    x = "Number of Interventions*",
+    y = "Frequency of Stations",
+    title = "Distribution of Interventions Across Stations",
+    caption= "*Intervention= Citi Bike removes a bike from a docking station.",
+    subtitle= "Stations with frequent interventions may indicate and imbalanced number of bikes at docking stations"
+  ) +
+  theme_minimal()
+```
+
+Add  a red, vertical line onto the histogram that marks `24` hours
+
+```{r}
+ggplot(interventions, aes(x = tripduration)) +
+  geom_histogram(binwidth = 10, fill = "dodgerblue3", color='dodgerblue4', alpha = 0.75) +
+  geom_vline(xintercept = 24, color = "red", linetype = "dashed", size = 1)+
+  labs(x = "Hours",
+    y = "Frequency of Interventions",
+    title = "Distribution of Trip Durations for Citi Bike Interventions",
+caption= "*Intervention= Citi Bike removes a bike from a docking station.",
+    subtitle= "Stations with frequent interventions may indicate and imbalanced number of bikes at docking stations")+ theme_minimal()
+```
+
+Overlay visual encodings onto a map of Manhattan. Create the base map from geographic data available at [Beta NYC](https://beta.nyc/products/boundaries-map/).
+
+```{r}
+# location of spatial polygon data frame to tibble (data.frame) for
+# boroughs and neighborhoods, convert to sf data frame
+
+url <- str_c(
+    'https://ssp3nc3r.github.io/',
+    '20213APAN5800K007/data/betanyc_hoods.geojson'
+    )
+
+nyc_neighborhoods <- read_sf(url)
+```
+
+Create base map:
+```{r}
+p_hoods <- 
+  
+  # initialize graph
+  ggplot() + 
+  
+  # remove most non-data ink
+  theme_void() +
+  
+  # add color for water (behind land polygons)
+  theme(
+    panel.background = element_rect(fill = 'lightblue')
+  ) +
+  
+  # map boundary data to visual elements (polygons)
+  geom_sf(
+    data = nyc_neighborhoods,
+    mapping = aes(geometry = geometry),
+    fill = 'white',
+    color = 'gray',
+    lwd = 0.1
+  ) +
+  
+  # define coordinate system and zoom in on Manhattan
+  coord_sf(
+    crs = sf::st_crs(4326), # World Geodetic System 1984 (WGS84)
+    xlim = c(-74.03, -73.91),
+    ylim = c( 40.695, 40.85)
+  )
+
+# display the graph
+p_hoods
+```
+
+Overlay geometric mappings 
+
+```{r}
+
+# Calculate the frequency of interventions at each location
+intervention_freq <- interventions %>%
+  group_by(end_station_longitude, end_station_latitude) %>%
+  summarise(num_interventions = n())
+
+# Plot interventions on the base map
+p_hoods +
+  geom_point(data = intervention_freq,
+    aes(x = end_station_longitude, 
+        y = end_station_latitude, 
+        color = num_interventions),size=3, alpha= .75, stroke=FALSE
+  ) +
+  scale_color_gradient(name = "Number of Interventions", low= "grey",high = 'black') +
+  labs(
+    title = "Citi Bike Interventions in Manhattan Neighborhoods",
+    subtitle = "Locations and frequency of Citi Bike interventions",
+    caption= "Data from Citibike 2019")
+
+
+```
+
+Combine  new observations from `interventions` with the original observed rides in `rider_trips` into a new data frame called `allmoves`.
+
+```{r}
+allmoves <- rider_trips %>%
+  mutate(usertype = ifelse(end_station_id != start_station_id, "Citi Bike", usertype)) %>%
+  filter(!is.na(end_station_id)) %>%
+  select(-birth_year, -gender)
+
+```
+
+Calculate the number of trips and interventions across time per station for 1) combined trips and interventions and 2) separately for just interventions.
+
+```{r}
+count_bikes <- function(data) {
+
+data %>% select(
+  start_station = start_station_name,
+  end_station = end_station_name,
+  start_time, end_time
+  ) %>%
+
+pivot_longer(
+  cols = everything(),
+  names_to = c( "n_bikes", ".value"),
+  names_sep = "_"
+  ) %>%
+    arrange(time) %>%
+    group_by(station) %>%
+    mutate(n_bikes = cumsum( if_else(n_bikes == 'start', -1, +1) ),
+           n_bikes = n_bikes - min(n_bikes) ) %>%
+    ungroup() %>%
+    rename(station_name = station, timestamp = time)
+  }
+
+all_available <- count_bikes(allmoves)
+i_available <- count_bikes(interventions)
+```
+
+Graph the two cumulative sums of all across time at one particular station: "W 31 St & 7 Ave", which is near Penn Station.
+
+```{r}
+# Filter data for station_id 379
+station_379 <- all_available %>%
+  filter(station_name == "W 31 St & 7 Ave")
+
+interventions_379 <- i_available %>%
+  filter(station_name == "W 31 St & 7 Ave")
+```
+```{r}
+ggplot(station_379, aes(x = timestamp, y = n_bikes)) +
+  geom_line() +
+  geom_line(data = interventions_379, aes(x = timestamp, y = n_bikes), color = "dodger blue") +
+  labs(
+    x = "Weeks in September",
+    y = "Number of Bikes",
+    title="September 2019 Citi Ride Activity at Penn Station",
+    caption="Data from Citibike 2019",
+    subtitle= "*Intervention= Citi Bike removes a bike from a docking station"
+  ) +
+  theme_minimal()+
+  theme(panel.background = element_rect((fill="grey95")))+
+  geom_text(data = station_379[which.max(station_379$n_bikes), ], aes(label = "All Moves", x = max(timestamp), y = n_bikes), vjust=-0.5, color = "black", size=3)+
+  geom_text(data = interventions_379[which.max(interventions_379$n_bikes), ], aes(label = "Interventions*", x = max(timestamp), y = n_bikes), vjust = -1, color = "dodger blue", size=3)+
+  geom_vline(xintercept = as.numeric(as.POSIXct("2019-09-23")), color='darkorange') +
+  annotate("text", x = as.POSIXct("2019-09-23"), y = max(station_379$n_bikes), label = "First day of Autumn", hjust = -.1, color = "darkorange", size = 3)
+```
+
+**References**
+
+Center for Spatial Research, Columbia University. (n.d.). Citi Bike Rebalancing Study. Retrieved from https://c4sr.columbia.edu/projects/citibike-rebalancing-study
+
+Baucke, S. (n.d.). Data in Wonderland. Retrieved from https://ssp3nc3r.github.io/data_in_wonderland/
